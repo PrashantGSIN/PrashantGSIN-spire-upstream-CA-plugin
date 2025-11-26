@@ -14,6 +14,7 @@ import (
 	"github.com/spiffe/spire-plugin-sdk/pluginsdk"
 	upstreamauthorityv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/server/upstreamauthority/v1"
 	configv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/service/common/config/v1"
+	"github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/types"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -149,10 +150,25 @@ func (p *Plugin) MintX509CAAndSubscribe(req *upstreamauthorityv1.MintX509CAReque
 		return status.Errorf(codes.Internal, "failed to sign CSR with external CA: %v", err)
 	}
 
+	// Convert [][]byte to []*types.X509Certificate
+	certChain := make([]*types.X509Certificate, len(certChainBytes))
+	for i, certBytes := range certChainBytes {
+		certChain[i] = &types.X509Certificate{
+			Asn1: certBytes,
+		}
+	}
+
+	rootCerts := make([]*types.X509Certificate, len(rootCertsBytes))
+	for i, certBytes := range rootCertsBytes {
+		rootCerts[i] = &types.X509Certificate{
+			Asn1: certBytes,
+		}
+	}
+
 	// Send the minted certificate back
 	resp := &upstreamauthorityv1.MintX509CAResponse{
-		X509CaChain:       certChainBytes,
-		UpstreamX509Roots: rootCertsBytes,
+		X509CaChain:       certChain,
+		UpstreamX509Roots: rootCerts,
 	}
 
 	if err := stream.Send(resp); err != nil {
