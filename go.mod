@@ -3,6 +3,7 @@ module github.com/yourusername/spire-upstream-ca-plugin
 go 1.21
 
 require (
+	github.com/globalsign/hvclient v1.0.1
 	github.com/hashicorp/go-hclog v1.6.2
 	github.com/hashicorp/hcl v1.0.0
 	github.com/spiffe/spire-plugin-sdk v1.9.0

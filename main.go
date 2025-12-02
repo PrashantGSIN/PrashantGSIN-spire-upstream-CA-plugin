@@ -9,11 +9,13 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io/ioutil"
+	"math/big"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/globalsign/hvclient"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/hcl"
 	"github.com/spiffe/spire-plugin-sdk/pluginmain"
@@ -55,6 +57,9 @@ type Plugin struct {
 
 	// The logger received from the framework via the SetLogger method
 	logger hclog.Logger
+
+	// HVCA client for making API calls
+	hvClient *hvclient.Client
 }
 
 func main() {
@@ -63,9 +68,6 @@ func main() {
 	pluginmain.Serve(
 		upstreamauthorityv1.UpstreamAuthorityPluginServer(plugin),
 		configv1.ConfigServiceServer(plugin),
-	)
-}
-
 // Configure configures the plugin. This is invoked by SPIRE when the plugin is
 // first loaded. In the future, it may be invoked to reconfigure the plugin.
 func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) (*configv1.ConfigureResponse, error) {
@@ -79,23 +81,46 @@ func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) 
 		return nil, status.Error(codes.InvalidArgument, "ca_endpoint or ca_url must be configured")
 	}
 
+	if config.APIKey == "" {
+		return nil, status.Error(codes.InvalidArgument, "api_key must be configured")
+	}
+
+	if config.CertPath == "" || config.KeyPath == "" {
+		return nil, status.Error(codes.InvalidArgument, "cert_path and key_path must be configured for mTLS")
+	}
+
 	if config.TrustBundlePath == "" {
 		return nil, status.Error(codes.InvalidArgument, "trust_bundle_path must be configured")
 	}
 
-	// Validate that trust bundle file exists and is readable
+	// Validate that files exist
 	if _, err := ioutil.ReadFile(config.TrustBundlePath); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to read trust bundle: %v", err)
 	}
 
+	// Initialize GlobalSign hvclient
+	hvConfig, err := p.createHVClientConfig(config)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "failed to create hvclient config: %v", err)
+	}
+
+	hvClient, err := hvclient.NewClient(ctx, hvConfig)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to create hvclient: %v", err)
+	}
+
+	p.hvClient = hvClient
 	p.setConfig(config)
 	
 	if p.logger != nil {
-		p.logger.Info("Plugin configured successfully",
+		p.logger.Info("Plugin configured successfully with GlobalSign hvclient",
 			"ca_endpoint", config.CAEndpoint,
 			"ca_url", config.CAURL,
 		)
 	}
+
+	return &configv1.ConfigureResponse{}, nil
+}}
 
 	return &configv1.ConfigureResponse{}, nil
 }
@@ -243,166 +268,72 @@ func (p *Plugin) signCSRWithExternalCA(ctx context.Context, config *Config, csrB
 	return certChain, rootCerts, nil
 }
 
-// callExternalCAAPI makes the actual API call to GlobalSign HVCA
+// callExternalCAAPI makes the actual API call to GlobalSign HVCA using hvclient
 func (p *Plugin) callExternalCAAPI(ctx context.Context, config *Config, csrBytes []byte, ttl int32) ([][]byte, error) {
-	p.logger.Info("Calling GlobalSign HVCA API to sign CSR")
+	p.logger.Info("Calling GlobalSign HVCA API to sign CSR using hvclient")
 
-	// Create HTTP client with timeout and optional mTLS
-	client, err := p.createHTTPClient(config)
+	// Parse the CSR
+	csr, err := x509.ParseCertificateRequest(csrBytes)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create HTTP client: %w", err)
+		return nil, fmt.Errorf("failed to parse CSR: %w", err)
 	}
 
-	// Convert CSR bytes to PEM format
-	csrPEM := pem.EncodeToMemory(&pem.Block{
-		Type:  "CERTIFICATE REQUEST",
-		Bytes: csrBytes,
-	})
-
-	if csrPEM == nil {
-		return nil, fmt.Errorf("failed to encode CSR to PEM")
-	}
-
-	// Step 1: Login to get access token (if needed)
-	// Note: You may need to implement persistent token management
-	// For now, we'll use the API key directly if supported
-
-	// Step 2: Submit certificate request
-	// GlobalSign Atlas API uses /v2/certificates endpoint
-	// Prepare request body according to GlobalSign Atlas API specification
-	reqBody := map[string]interface{}{
-		"validity": map[string]interface{}{
-			"not_after": map[string]interface{}{
-				"months": ttl / (30 * 24 * 3600), // Convert seconds to approximate months
-			},
+	// Create hvclient Request with the CSR
+	hvRequest := &hvclient.Request{
+		CSR: csr,
+		Validity: &hvclient.Validity{
+			NotBefore: time.Now(),
+			// Calculate NotAfter based on TTL (ttl is in seconds)
+			NotAfter: time.Now().Add(time.Duration(ttl) * time.Second),
 		},
-		"public_key": string(csrPEM),
 	}
 
-	jsonData, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	// Determine base URL - use ca_url if set, otherwise ca_endpoint
-	baseURL := config.CAURL
-	if baseURL == "" {
-		baseURL = config.CAEndpoint
-	}
-
-	p.logger.Debug("Sending request to GlobalSign HVCA",
-		"base_url", baseURL,
-		"endpoint", "/v2/certificates",
+	p.logger.Debug("Submitting certificate request to GlobalSign HVCA",
+		"ttl_seconds", ttl,
+		"not_after", hvRequest.Validity.NotAfter,
 	)
 
-	// Make API request to GlobalSign HVCA /v2/certificates endpoint
-	// Don't add /v2 if it's already in the base URL
-	apiEndpoint := baseURL
-	if !strings.Contains(apiEndpoint, "/v2") {
-		apiEndpoint += "/v2"
-	}
-	apiEndpoint += "/certificates"
-	req, err := http.NewRequestWithContext(ctx, "POST", apiEndpoint, bytes.NewBuffer(jsonData))
+	// Request certificate from HVCA
+	serialNumber, err := p.hvClient.CertificateRequest(ctx, hvRequest)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, fmt.Errorf("failed to request certificate from HVCA: %w", err)
 	}
 
-	// Set headers for GlobalSign Atlas API
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	
-	// Add authentication - GlobalSign HVCA uses api_key in header
-	if config.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+config.APIKey)
-		// Some GlobalSign APIs may also accept api_key header
-		req.Header.Set("X-API-Key", config.APIKey)
-	}
+	p.logger.Info("Certificate request successful", "serial_number", serialNumber.Text(16))
 
-	// Execute request
-	resp, err := client.Do(req)
+	// Retrieve the issued certificate
+	certInfo, err := p.hvClient.CertificateRetrieve(ctx, serialNumber)
 	if err != nil {
-		return nil, fmt.Errorf("failed to execute request: %w", err)
+		return nil, fmt.Errorf("failed to retrieve certificate: %w", err)
 	}
-	defer resp.Body.Close()
 
-	// Read response body
-	body, err := ioutil.ReadAll(resp.Body)
+	// Parse the PEM certificate
+	block, _ := pem.Decode([]byte(certInfo.PEM))
+	if block == nil || block.Type != "CERTIFICATE" {
+		return nil, fmt.Errorf("failed to decode certificate PEM")
+	}
+
+	certChain := [][]byte{block.Bytes}
+	p.logger.Debug("Successfully retrieved certificate from HVCA")
+
+	// Get the trust chain (intermediate certificates)
+	trustChain, err := p.hvClient.TrustChain(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
-	}
-
-	// Check status code
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != 201 {
-		p.logger.Error("GlobalSign HVCA API returned error",
-			"status", resp.Status,
-			"status_code", resp.StatusCode,
-			"body", string(body),
-		)
-		return nil, fmt.Errorf("GlobalSign HVCA returned error: %s - %s", resp.Status, string(body))
-	}
-
-	p.logger.Debug("Received response from GlobalSign HVCA",
-		"status", resp.Status,
-		"body_length", len(body),
-	)
-
-	// Parse response according to GlobalSign Atlas API format
-	var result struct {
-		Certificate string `json:"certificate"`
-		// Alternative possible field names
-		Cert      string `json:"cert"`
-		PublicKey string `json:"public_key"`
-		// Certificate ID for tracking
-		ID string `json:"id"`
-	}
-
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
-	}
-
-	// Determine which field contains the certificate
-	certPEM := result.Certificate
-	if certPEM == "" {
-		certPEM = result.Cert
-	}
-	if certPEM == "" {
-		certPEM = result.PublicKey
-	}
-
-	if certPEM == "" {
-		p.logger.Error("No certificate found in response", "response_body", string(body))
-		return nil, fmt.Errorf("no certificate found in response")
-	}
-
-	// Convert PEM certificate to DER format (SPIRE expects DER-encoded certificates)
-	var certChain [][]byte
-
-	// Parse and add the issued certificate
-	block, _ := pem.Decode([]byte(certPEM))
-	if block != nil && block.Type == "CERTIFICATE" {
-		certChain = append(certChain, block.Bytes)
-		p.logger.Debug("Added issued certificate to chain")
+		p.logger.Warn("Failed to retrieve trust chain", "error", err)
 	} else {
-		return nil, fmt.Errorf("invalid certificate in response")
-	}
-
-	// Get the certificate chain from GlobalSign (intermediate certificates)
-	// Use /v2/trustchain endpoint to get intermediate certificates
-	intermediates, err := p.getTrustChain(ctx, config, client)
-	if err != nil {
-		p.logger.Warn("Failed to fetch trust chain", "error", err)
-		// Continue without intermediates - some CAs include them in the cert response
-	} else {
-		certChain = append(certChain, intermediates...)
-	}
-
-	if len(certChain) == 0 {
-		return nil, fmt.Errorf("no valid certificates in CA response")
+		// Add intermediate certificates to the chain
+		for i, certPEM := range trustChain {
+			block, _ := pem.Decode([]byte(certPEM))
+			if block != nil && block.Type == "CERTIFICATE" {
+				certChain = append(certChain, block.Bytes)
+				p.logger.Debug("Added intermediate certificate to chain", "index", i)
+			}
+		}
 	}
 
 	p.logger.Info("Successfully retrieved certificate from GlobalSign HVCA",
 		"chain_length", len(certChain),
-		"cert_id", result.ID,
+		"serial_number", serialNumber.Text(16),
 	)
 
 	return certChain, nil
@@ -597,4 +528,32 @@ func (p *Plugin) createHTTPClient(config *Config) (*http.Client, error) {
 	}
 
 	return client, nil
+}
+
+// createHVClientConfig creates hvclient configuration from plugin config
+func (p *Plugin) createHVClientConfig(config *Config) (*hvclient.Config, error) {
+	// Determine base URL
+	baseURL := config.CAURL
+	if baseURL == "" {
+		baseURL = config.CAEndpoint
+	}
+
+	// Load TLS certificate and key for mTLS
+	cert, err := tls.LoadX509KeyPair(config.CertPath, config.KeyPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load client certificate: %w", err)
+	}
+
+	hvConfig := &hvclient.Config{
+		URL:       baseURL,
+		APIKey:    config.APIKey,
+		APISecret: config.APIKey, // Use API key as secret if no separate secret
+		TLSCert:   &cert,
+	}
+
+	p.logger.Info("Created GlobalSign hvclient configuration",
+		"url", baseURL,
+	)
+
+	return hvConfig, nil
 }
