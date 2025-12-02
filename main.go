@@ -68,6 +68,9 @@ func main() {
 	pluginmain.Serve(
 		upstreamauthorityv1.UpstreamAuthorityPluginServer(plugin),
 		configv1.ConfigServiceServer(plugin),
+	)
+}
+
 // Configure configures the plugin. This is invoked by SPIRE when the plugin is
 // first loaded. In the future, it may be invoked to reconfigure the plugin.
 func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) (*configv1.ConfigureResponse, error) {
@@ -120,9 +123,9 @@ func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) 
 	}
 
 	return &configv1.ConfigureResponse{}, nil
-}}
+}
 
-	return &configv1.ConfigureResponse{}, nil
+// SetLogger is called by the framework when the plugin is loaded
 }
 
 // SetLogger is called by the framework when the plugin is loaded
