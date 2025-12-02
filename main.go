@@ -320,13 +320,10 @@ func (p *Plugin) callExternalCAAPI(ctx context.Context, config *Config, csrBytes
 		p.logger.Warn("Failed to retrieve trust chain", "error", err)
 	} else {
 		// Add intermediate certificates to the chain
-		for i, certPEM := range trustChain {
-			// certPEM is already a string from hvclient.TrustChain()
-			block, _ := pem.Decode([]byte(certPEM))
-			if block != nil && block.Type == "CERTIFICATE" {
-				certChain = append(certChain, block.Bytes)
-				p.logger.Debug("Added intermediate certificate to chain", "index", i)
-			}
+		// trustChain is []*x509.Certificate from hvclient.TrustChain()
+		for i, cert := range trustChain {
+			certChain = append(certChain, cert.Raw)
+			p.logger.Debug("Added intermediate certificate to chain", "index", i)
 		}
 	}
 
