@@ -35,6 +35,7 @@ type Config struct {
 	CAEndpoint      string `hcl:"ca_endpoint"`
 	CAURL           string `hcl:"ca_url"`
 	APIKey          string `hcl:"api_key"`
+	APISecret       string `hcl:"api_secret"`
 	CertPath        string `hcl:"cert_path"`
 	KeyPath         string `hcl:"key_path"`
 	TrustBundlePath string `hcl:"trust_bundle_path"`
@@ -534,6 +535,14 @@ func (p *Plugin) createHVClientConfig(config *Config) (*hvclient.Config, error) 
 		baseURL = config.CAEndpoint
 	}
 
+	if p.logger != nil {
+		p.logger.Debug("Creating hvclient configuration",
+			"url", baseURL,
+			"cert_path", config.CertPath,
+			"key_path", config.KeyPath,
+		)
+	}
+
 	// Load TLS certificate and key for mTLS
 	cert, err := tls.LoadX509KeyPair(config.CertPath, config.KeyPath)
 	if err != nil {
@@ -546,17 +555,31 @@ func (p *Plugin) createHVClientConfig(config *Config) (*hvclient.Config, error) 
 		return nil, fmt.Errorf("failed to parse X.509 certificate: %w", err)
 	}
 
+	// Use api_secret if provided, otherwise fall back to api_key
+	apiSecret := config.APISecret
+	if apiSecret == "" {
+		apiSecret = config.APIKey
+		if p.logger != nil {
+			p.logger.Warn("api_secret not configured, using api_key for both key and secret")
+		}
+	}
+
 	hvConfig := &hvclient.Config{
 		URL:       baseURL,
 		APIKey:    config.APIKey,
-		APISecret: config.APIKey, // Use API key as secret if no separate secret
+		APISecret: apiSecret,
 		TLSCert:   x509Cert,
 		TLSKey:    cert.PrivateKey,
 	}
 
-	p.logger.Info("Created GlobalSign hvclient configuration",
-		"url", baseURL,
-	)
+	if p.logger != nil {
+		p.logger.Info("Created GlobalSign hvclient configuration",
+			"url", baseURL,
+			"has_api_key", config.APIKey != "",
+			"has_api_secret", config.APISecret != "",
+			"cert_subject", x509Cert.Subject.String(),
+		)
+	}
 
 	return hvConfig, nil
 }
