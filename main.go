@@ -126,9 +126,6 @@ func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) 
 }
 
 // SetLogger is called by the framework when the plugin is loaded
-}
-
-// SetLogger is called by the framework when the plugin is loaded
 func (p *Plugin) SetLogger(logger hclog.Logger) {
 	p.logger = logger
 }
