@@ -331,13 +331,19 @@ func (p *Plugin) requestCertificateWithSignature(ctx context.Context, config *Co
 		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
 	}
 
-	// Set headers - HVCA may require specific content type
+	// Set headers - HVCA requires mTLS authentication plus API key/secret headers
 	httpReq.Header.Set("Content-Type", "application/json; charset=utf-8")
 	httpReq.Header.Set("Accept", "application/json")
+	
+	// HVCA authentication: mTLS cert + X-API headers only (no Authorization header needed)
 	httpReq.Header.Set("X-API-Key", config.APIKey)
-	if config.APISecret != "" {
-		httpReq.Header.Set("X-API-Secret", config.APISecret)
-	}
+	httpReq.Header.Set("X-API-Secret", config.APISecret)
+	
+	p.logger.Debug("Request headers",
+		"content-type", httpReq.Header.Get("Content-Type"),
+		"has_api_key", config.APIKey != "",
+		"has_api_secret", config.APISecret != "",
+	)
 
 	// Create HTTP client with mTLS
 	httpClient, err := p.createHTTPClient(config)
