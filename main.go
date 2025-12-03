@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -335,12 +336,13 @@ func (p *Plugin) requestCertificateWithSignature(ctx context.Context, config *Co
 	httpReq.Header.Set("Content-Type", "application/json; charset=utf-8")
 	httpReq.Header.Set("Accept", "application/json")
 	
-	// HVCA authentication: mTLS cert + X-API headers only (no Authorization header needed)
-	httpReq.Header.Set("X-API-Key", config.APIKey)
-	httpReq.Header.Set("X-API-Secret", config.APISecret)
+	// HVCA authentication: HTTP Basic Auth (api_key:api_secret) + mTLS
+	basicAuth := base64.StdEncoding.EncodeToString([]byte(config.APIKey + ":" + config.APISecret))
+	httpReq.Header.Set("Authorization", "Basic "+basicAuth)
 	
 	p.logger.Debug("Request headers",
 		"content-type", httpReq.Header.Get("Content-Type"),
+		"auth_type", "Basic",
 		"has_api_key", config.APIKey != "",
 		"has_api_secret", config.APISecret != "",
 	)
@@ -441,10 +443,16 @@ func (p *Plugin) callExternalCAAPI(ctx context.Context, config *Config, csrBytes
 		"signature_hash", "SHA-256",
 	)
 
-	// Make direct API call with signature field included
-	serialNumber, err := p.requestCertificateWithSignature(ctx, config, hvRequest)
+	// Try using hvclient directly first to see what error we get
+	p.logger.Info("Attempting certificate request using hvclient library")
+	serialNumber, err := p.hvClient.CertificateRequest(ctx, hvRequest)
 	if err != nil {
-		return nil, fmt.Errorf("failed to request certificate from HVCA: %w", err)
+		p.logger.Warn("hvclient.CertificateRequest failed, trying direct API", "error", err)
+		// Fall back to direct API call with signature field included
+		serialNumber, err = p.requestCertificateWithSignature(ctx, config, hvRequest)
+		if err != nil {
+			return nil, fmt.Errorf("failed to request certificate from HVCA: %w", err)
+		}
 	}
 
 	p.logger.Info("Certificate request successful", "serial_number", serialNumber.Text(16))
