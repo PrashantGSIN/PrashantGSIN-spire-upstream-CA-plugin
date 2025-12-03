@@ -282,18 +282,27 @@ type SignatureInfo struct {
 
 // requestCertificateWithSignature makes a direct HTTP API call to HVCA with signature field
 func (p *Plugin) requestCertificateWithSignature(ctx context.Context, config *Config, req *hvclient.Request) (*big.Int, error) {
-	// Wrap the request to include signature field
-	wrappedReq := &SignatureWrapper{
-		Request: req,
-		Signature: &SignatureInfo{
-			HashAlgorithm: "SHA-256",
-		},
-	}
-
-	// Marshal the request to JSON
-	reqJSON, err := json.Marshal(wrappedReq)
+	// First marshal the hvclient.Request normally
+	reqJSON, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	// Parse it back to add the signature field
+	var reqMap map[string]interface{}
+	if err := json.Unmarshal(reqJSON, &reqMap); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal request: %w", err)
+	}
+
+	// Add signature field
+	reqMap["signature"] = map[string]string{
+		"hash_algorithm": "SHA-256",
+	}
+
+	// Marshal back to JSON
+	reqJSON, err = json.Marshal(reqMap)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal final request: %w", err)
 	}
 
 	p.logger.Debug("Certificate request JSON", "json", string(reqJSON))
@@ -303,7 +312,18 @@ func (p *Plugin) requestCertificateWithSignature(ctx context.Context, config *Co
 	if baseURL == "" {
 		baseURL = config.CAEndpoint
 	}
-	apiURL := strings.TrimSuffix(baseURL, "/") + "/v2/certificate"
+	
+	// Ensure we have the correct endpoint path
+	// If baseURL already contains /v2, just append /certificates
+	// Otherwise, append /v2/certificates
+	var apiURL string
+	if strings.Contains(baseURL, "/v2") {
+		apiURL = strings.TrimSuffix(baseURL, "/") + "/certificates"
+	} else {
+		apiURL = strings.TrimSuffix(baseURL, "/") + "/v2/certificates"
+	}
+	
+	p.logger.Debug("API endpoint", "url", apiURL)
 
 	// Create HTTP request
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewReader(reqJSON))
@@ -311,8 +331,9 @@ func (p *Plugin) requestCertificateWithSignature(ctx context.Context, config *Co
 		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
 	}
 
-	// Set headers
-	httpReq.Header.Set("Content-Type", "application/json")
+	// Set headers - HVCA may require specific content type
+	httpReq.Header.Set("Content-Type", "application/json; charset=utf-8")
+	httpReq.Header.Set("Accept", "application/json")
 	httpReq.Header.Set("X-API-Key", config.APIKey)
 	if config.APISecret != "" {
 		httpReq.Header.Set("X-API-Secret", config.APISecret)
