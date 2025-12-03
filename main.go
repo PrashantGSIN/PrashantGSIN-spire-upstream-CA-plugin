@@ -277,9 +277,25 @@ func (p *Plugin) callExternalCAAPI(ctx context.Context, config *Config, csrBytes
 		return nil, fmt.Errorf("failed to parse CSR: %w", err)
 	}
 
-	// Create hvclient Request with the CSR
+	// Extract Common Name from CSR subject or use a default
+	commonName := csr.Subject.CommonName
+	if commonName == "" {
+		// If CSR doesn't have CN, use the first DNS name or a default
+		if len(csr.DNSNames) > 0 {
+			commonName = csr.DNSNames[0]
+		} else {
+			// Use a default CN for SPIRE intermediate CA
+			commonName = "SPIRE Intermediate CA"
+		}
+		p.logger.Info("CSR missing Common Name, using generated value", "cn", commonName)
+	}
+
+	// Create hvclient Request with the CSR and required subject DN
 	hvRequest := &hvclient.Request{
 		CSR: csr,
+		Subject: &hvclient.DN{
+			CommonName: commonName,
+		},
 		Validity: &hvclient.Validity{
 			NotBefore: time.Now(),
 			// Calculate NotAfter based on TTL (ttl is in seconds)
