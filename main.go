@@ -3,8 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/asn1"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
@@ -489,7 +492,32 @@ func (p *Plugin) callExternalCAAPI(ctx context.Context, config *Config, csrBytes
 		p.logger.Info("CSR missing Common Name, using generated value", "cn", commonName)
 	}
 
+	// Log the public key type from the CSR
+	pubKeyType := "unknown"
+	keyLength := 0
+	switch pub := csr.PublicKey.(type) {
+	case *rsa.PublicKey:
+		pubKeyType = "RSA"
+		keyLength = pub.N.BitLen()
+	case *ecdsa.PublicKey:
+		pubKeyType = "ECDSA"
+		keyLength = pub.Curve.Params().BitSize
+	default:
+		pubKeyType = fmt.Sprintf("%T", csr.PublicKey)
+	}
+	
+	p.logger.Info("CSR public key information",
+		"key_type", pubKeyType,
+		"key_length", keyLength,
+		"signature_algorithm", csr.SignatureAlgorithm.String(),
+	)
+
 	// Create hvclient Request with the CSR and required subject DN
+	// Note: According to HVCA validation policy:
+	// - public_key.key_type must be RSA (2048, 3072, or 4096 bits)
+	// - public_key.key_format must be PKCS10 (CSR)
+	// - extended_key_usages must include exactly 2 EKUs: ServerAuth and ClientAuth
+	// - signature.hash_algorithm must be SHA-256 or SHA-384
 	hvRequest := &hvclient.Request{
 		CSR: csr,
 		Subject: &hvclient.DN{
@@ -499,6 +527,11 @@ func (p *Plugin) callExternalCAAPI(ctx context.Context, config *Config, csrBytes
 			NotBefore: time.Now(),
 			// Calculate NotAfter based on TTL (ttl is in seconds)
 			NotAfter: time.Now().Add(time.Duration(ttl) * time.Second),
+		},
+		// Add required Extended Key Usages per validation policy
+		EKUs: []asn1.ObjectIdentifier{
+			{1, 3, 6, 1, 5, 5, 7, 3, 1}, // Server Authentication
+			{1, 3, 6, 1, 5, 5, 7, 3, 2}, // Client Authentication
 		},
 	}
 
